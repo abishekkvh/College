@@ -1,0 +1,6 @@
+void main()
+{
+int a, b=10;
+float c;
+c = a+b*10.3;
+}
