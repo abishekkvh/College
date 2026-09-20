@@ -1,656 +1,347 @@
-# C Network Programming Utilities
+# EX7 — Concurrent TCP Systems in C
 
-A collection of C network programming applications demonstrating **TCP socket programming**, **client-server communication**, **multi-process concurrency using `fork()`**, **multi-threaded concurrency using POSIX threads (`pthread`)**, and **synchronization using mutexes**.
+> A socket-programming laboratory that grows from focused client/server exercises into four concurrent, stateful TCP services with synchronization, persistence, logging, defensive protocol parsing, and integration tests.
 
-The repository contains three main networking modules:
+![Language](https://img.shields.io/badge/language-C11-00599C?style=flat-square&logo=c)
+![Networking](https://img.shields.io/badge/networking-TCP%2FIPv4-2F80ED?style=flat-square)
+![Concurrency](https://img.shields.io/badge/concurrency-POSIX%20threads-6A5ACD?style=flat-square)
+![Tests](https://img.shields.io/badge/integration%20tests-9%20passing-2EA44F?style=flat-square)
 
-* File Transfer System
-* Simulated ARP Lookup System
-* Interactive TCP Chat System
+## Why this project is more than a socket demo
 
----
+Opening a socket is the easy part. The interesting engineering begins when clients overlap, disconnect halfway through a request, send malformed input, compete for the same resource, or receive a partial TCP write.
 
-## Module Overview
+This repository addresses those cases explicitly:
 
-| File                 | Role                       | Concurrency Model          | Main Technologies / System Calls                      |
-| -------------------- | -------------------------- | -------------------------- | ----------------------------------------------------- |
-| `ser_file.c`         | File Transfer Server       | Multi-Process (`fork`)     | TCP sockets, `fopen`, `recv`, `waitpid`               |
-| `cli_file.c`         | File Transfer Client       | Single-Threaded            | TCP sockets, `fopen`, `send`, `basename`              |
-| `ser_arp.c`          | ARP Lookup Server          | Multi-Threaded (`pthread`) | TCP, hash table, `pthread_mutex`, `popen("arp -a")`   |
-| `received_ser_arp.c` | ARP Server - Linux Variant | Multi-Threaded (`pthread`) | TCP, hash table, `pthread_mutex`, `popen("ip neigh")` |
-| `cli_arp.c`          | ARP Lookup Client          | Single-Threaded            | TCP sockets, `inet_pton`, `send`, `recv`              |
-| `ser_chat.c`         | TCP Chat Server            | Multi-Process (`fork`)     | TCP sockets, `fgets`, `send`, `recv`                  |
-| `cli_chat.c`         | TCP Chat Client            | Single-Threaded            | TCP sockets, `fgets`, `send`, `recv`                  |
+- thread-per-connection servers with a bounded 64-client limit;
+- complete-send loops and framed, bounded line parsing over TCP streams;
+- mutex-protected shared state with deliberately small critical sections;
+- independent per-client sessions and cleanup after abrupt disconnects;
+- durable, replayable hotel transactions committed with `fsync`;
+- race-free chat broadcasts with per-client output serialization;
+- file downloads with exact byte counts, partial-write handling, and path validation;
+- timestamped, mutex-serialized activity logs;
+- integration tests for real concurrent races, persistence, malformed traffic, and binary transfers;
+- warning-clean C11 builds, also exercised with AddressSanitizer and UndefinedBehaviorSanitizer.
 
----
+## Systems included
 
-# 1. File Transfer System
+| System | Concurrency model | Shared-state guarantee | Notable behavior |
+| --- | --- | --- | --- |
+| ARP lookup | One request per connection | Mutex-protected simulated ARP table | Hashing with linear probing; generated MAC mappings; system ARP display |
+| Interactive chat | Process per client | Independent connection state | Bidirectional terminal conversation and clean quit handling |
+| Basic file transfer | Process per client | Independent file streams | Filename header followed by raw file bytes |
+| Online examination | Thread per client | Account/session and question locks | Authentication, isolated answer sheets, evaluation, duplicate-login prevention |
+| Hotel reservation | Thread per client | Single transactional booking mutex | Exactly one winner per room, secure reservation tokens, durable journal replay |
+| File sharing | Thread per client | Independent descriptors and directory streams | Concurrent listing/download, binary-safe framing, symlink/path rejection |
+| Chat notification | Thread per client | Client registry plus per-client output locks | Broadcast messages, presence events, live user list, safe disconnect cleanup |
 
-### Files
+The first three programs demonstrate the core socket lifecycle. The four systems under `Self-Questions/` apply those fundamentals to realistic concurrency and failure scenarios.
 
-* `ser_file.c`
-* `cli_file.c`
+## Architecture
 
-### Protocol
+```mermaid
+flowchart LR
+    C1[Client 1] -->|TCP| L[Listening socket]
+    C2[Client 2] -->|TCP| L
+    CN[Client N] -->|TCP| L
+    L --> W1[Detached worker thread]
+    L --> W2[Detached worker thread]
+    L --> WN[Detached worker thread]
+    W1 & W2 & WN --> P[Service protocol handler]
+    P --> S[(Synchronized shared state)]
+    P --> A[(Timestamped audit log)]
+```
 
-The file transfer application uses a custom file-transfer protocol over:
+The advanced servers share a small networking layer in `Self-Questions/common/`:
+
+- `tcp_serve()` validates the port, creates the listener, accepts clients, enforces the connection limit, and launches detached workers.
+- `recv_line()` converts the TCP byte stream into printable ASCII request lines and rejects oversized, truncated, or malformed frames.
+- `send_all()` handles short writes and interrupted system calls until the entire response is transmitted.
+- `log_event()` serializes timestamped activity records so concurrent threads cannot interleave log lines.
+- `terminal.c` is a polling interactive client used by the examination, hotel, and notification-chat systems.
+
+The shared layer ignores `SIGPIPE`, applies receive/send timeouts, and guarantees socket and client-count cleanup when a worker exits.
+
+## Repository layout
 
 ```text
-TCP (SOCK_STREAM)
-```
-
-TCP provides reliable and ordered delivery of the transmitted file data.
-
-### Client - `cli_file.c`
-
-The client performs the following operations:
-
-1. Accepts the server IP address and port number.
-2. Prompts the user to enter the path of the file to be transferred.
-3. Opens the selected file in binary read mode.
-4. Extracts the filename from the supplied file path.
-5. Establishes a TCP connection with the server.
-6. Sends the filename followed by a newline character (`\n`).
-7. Reads the file in chunks of approximately `1024` bytes.
-8. Sends each chunk to the server using `send()`.
-9. Closes the file and socket after the transfer is complete.
-
-### Server - `ser_file.c`
-
-The server performs the following operations:
-
-1. Creates a TCP socket.
-2. Binds the socket to the specified port.
-3. Listens for incoming client connections.
-4. Accepts a client connection.
-5. Uses `fork()` to create a child process for each connected client.
-6. Reads the filename sent by the client.
-7. Creates an output file prefixed with:
-
-```text
-received_
-```
-
-For example:
-
-```text
-document.pdf
-```
-
-is stored as:
-
-```text
-received_document.pdf
-```
-
-8. Receives file data using `recv()`.
-9. Writes the received binary data to the output file.
-10. Continues receiving until the client closes the connection.
-11. Uses non-blocking `waitpid()` to clean up terminated child processes and prevent zombie processes.
-
-### Architecture
-
-```text
-                TCP Connection
-+---------+  --------------------->  +---------+
-| Client  |                           | Server  |
-+---------+                           +---------+
-     |                                    |
-     | Send filename                      |
-     |----------------------------------->|
-     |                                    |
-     | Send file data                     |
-     |----------------------------------->|
-     |                                    |
-     |                              Save as
-     |                         received_<filename>
-```
-
----
-
-# 2. Simulated ARP Lookup Engine
-
-### Files
-
-* `ser_arp.c`
-* `received_ser_arp.c`
-* `cli_arp.c`
-
-### Protocol
-
-The ARP application uses a request-response model over:
-
-```text
-TCP (SOCK_STREAM)
-```
-
-The client sends an IPv4 address and the server returns the corresponding MAC address.
-
----
-
-## ARP Server
-
-### Files
-
-```text
-ser_arp.c
-received_ser_arp.c
-```
-
-The server maintains an in-memory ARP cache using a structure similar to:
-
-```c
-struct ARP arr[10];
-```
-
-The hash table stores mappings between:
-
-```text
-IP Address → MAC Address
-```
-
-### Hash Table
-
-The ARP cache uses:
-
-* Fixed-size hash table
-* Hash-based indexing
-* Linear probing for collision handling
-
-When a requested IP address already exists in the cache, the corresponding MAC address is returned immediately.
-
-If the address is not present, the server generates a deterministic MAC address and stores the new mapping in the cache.
-
----
-
-## Multi-Threaded Client Handling
-
-The ARP server uses POSIX threads to handle multiple clients concurrently.
-
-Important functions include:
-
-```c
-pthread_create()
-pthread_detach()
-pthread_mutex_lock()
-pthread_mutex_unlock()
-```
-
-Each connected client is handled by a separate thread.
-
-The threads are detached using:
-
-```c
-pthread_detach()
-```
-
-so that completed threads can release their resources automatically.
-
----
-
-## Thread Synchronization
-
-Because multiple threads may access the ARP hash table simultaneously, a mutex is used to protect the shared data.
-
-```c
-pthread_mutex_t
-```
-
-The mutex prevents multiple threads from modifying the ARP cache at the same time.
-
-Conceptually:
-
-```text
-Thread 1 ----\
-              \
-Thread 2 ------> Mutex ---> Shared ARP Cache
-              /
-Thread 3 ----/
-```
-
-This prevents race conditions.
-
----
-
-## Host ARP Table
-
-The server can also display ARP or neighbor information available on the host operating system.
-
-### `ser_arp.c`
-
-Uses:
-
-```bash
-arp -a
-```
-
-through:
-
-```c
-popen()
-```
-
-### `received_ser_arp.c`
-
-Uses the Linux command:
-
-```bash
-ip neigh
-```
-
-through:
-
-```c
-popen()
-```
-
----
-
-## ARP Client - `cli_arp.c`
-
-The client:
-
-1. Connects to the ARP server.
-2. Prompts the user for an IPv4 address.
-3. Validates the entered IPv4 address using:
-
-```c
-inet_pton()
-```
-
-4. Sends the IP address to the server.
-5. Waits for the server response.
-6. Receives the corresponding MAC address.
-7. Displays the lookup result to the user.
-
-### Architecture
-
-```text
-                         TCP
-+-------------+    IP Address    +----------------+
-| ARP Client  | ---------------->|   ARP Server   |
-+-------------+                  +----------------+
-                                        |
-                                        v
-                               +-----------------+
-                               | ARP Hash Table  |
-                               | IP -> MAC       |
-                               +-----------------+
-                                        |
-                                        v
-                               Generate / Lookup
-                                  MAC Address
-                                        |
-+-------------+     MAC Address         |
-| ARP Client  | <-----------------------+
-+-------------+
-```
-
----
-
-# 3. Interactive TCP Chat System
-
-### Files
-
-* `ser_chat.c`
-* `cli_chat.c`
-
-### Protocol
-
-The chat application uses:
-
-```text
-TCP (SOCK_STREAM)
-```
-
-Communication follows a simple turn-based text messaging model.
-
----
-
-## Chat Server - `ser_chat.c`
-
-The chat server:
-
-1. Creates a TCP socket.
-2. Binds the socket to the specified port.
-3. Listens for incoming client connections.
-4. Accepts client connections.
-5. Creates a separate child process using:
-
-```c
-fork()
-```
-
-for each connected client.
-
-6. Sends a client identification message such as:
-
-```text
-You are Client 1
-```
-
-7. Receives messages from the client.
-8. Reads server responses from standard input using:
-
-```c
-fgets()
-```
-
-9. Sends responses back to the client.
-10. Continues the conversation until either side terminates the chat.
-
----
-
-## Chat Client - `cli_chat.c`
-
-The client:
-
-1. Connects to the TCP chat server.
-2. Displays the welcome message received from the server.
-3. Accepts user input using:
-
-```c
-fgets()
-```
-
-4. Sends the message to the server.
-5. Waits for the server response.
-6. Displays the received message.
-7. Continues alternating between sending and receiving messages.
-
-The chat session ends when either side enters:
-
-```text
-quit
-```
-
-or:
-
-```text
-/quit
-```
-
-### Architecture
-
-```text
-          TCP Connection
-
-+-------------+                +-------------+
-| Chat Client |                | Chat Server |
-+-------------+                +-------------+
-       |                              |
-       |------ Client Message ------->|
-       |                              |
-       |<----- Server Response -------|
-       |                              |
-       |------ Client Message ------->|
-       |                              |
-       |<----- Server Response -------|
-       |                              |
-```
-
----
-
-# Concepts Demonstrated
-
-This project demonstrates several important concepts in Unix network programming.
-
-### Socket Programming
-
-* `socket()`
-* `bind()`
-* `listen()`
-* `accept()`
-* `connect()`
-* `send()`
-* `recv()`
-* `close()`
-
-### Process-Based Concurrency
-
-Used by:
-
-```text
-ser_file.c
-ser_chat.c
-```
-
-using:
-
-```c
-fork()
-```
-
-Each client connection can be handled by a separate process.
-
-### Thread-Based Concurrency
-
-Used by:
-
-```text
-ser_arp.c
-received_ser_arp.c
-```
-
-using POSIX threads:
-
-```c
-pthread_create()
-```
-
-### Synchronization
-
-The ARP server protects shared hash-table data using:
-
-```c
-pthread_mutex_t
-```
-
-### File Handling
-
-The file-transfer application uses:
-
-```c
-fopen()
-fread()
-fwrite()
-fclose()
-```
-
-### Network Address Handling
-
-Functions such as:
-
-```c
-inet_pton()
-```
-
-are used to validate and convert IPv4 addresses.
-
----
-
-# Compilation
-
-The programs can be compiled using GCC.
-
-## 1. File Transfer Module
-
-```bash
-gcc -Wall -Wextra -o ser_file ser_file.c
-gcc -Wall -Wextra -o cli_file cli_file.c
-```
-
-## 2. ARP Lookup Module
-
-The ARP servers use POSIX threads, so the `-pthread` option is required.
-
-```bash
-gcc -Wall -Wextra -pthread -o ser_arp ser_arp.c
-gcc -Wall -Wextra -pthread -o received_ser_arp received_ser_arp.c
-
-gcc -Wall -Wextra -o cli_arp cli_arp.c
-```
-
-## 3. TCP Chat Module
-
-```bash
-gcc -Wall -Wextra -o ser_chat ser_chat.c
-gcc -Wall -Wextra -o cli_chat cli_chat.c
-```
-
----
-
-# Usage
-
-## File Transfer
-
-### Terminal 1 - Start Server
-
-```bash
-./ser_file 8080
-```
-
-### Terminal 2 - Start Client
-
-```bash
-./cli_file 127.0.0.1 8080
-```
-
-Example input:
-
-```text
-Enter path of file to send: document.pdf
-```
-
-The server stores the received file as:
-
-```text
-received_document.pdf
-```
-
----
-
-# ARP Lookup
-
-### Terminal 1 - Start Server
-
-```bash
-./ser_arp 9090
-```
-
-or, for the Linux variant:
-
-```bash
-./received_ser_arp 9090
-```
-
-### Terminal 2 - Start Client
-
-```bash
-./cli_arp 127.0.0.1 9090
-```
-
-Example:
-
-```text
-Enter IP address: 192.168.1.15
-```
-
-The server searches its ARP cache and returns the corresponding MAC address.
-
----
-
-# Interactive TCP Chat
-
-### Terminal 1 - Start Server
-
-```bash
-./ser_chat 7070
-```
-
-### Terminal 2 - Start Client
-
-```bash
-./cli_chat 127.0.0.1 7070
-```
-
-Messages can then be exchanged interactively between the client and server.
-
-To terminate the chat, enter:
-
-```text
-quit
-```
-
-or:
-
-```text
-/quit
-```
-
----
-
-# Project Structure
-
-```text
-.
-├── ser_file.c
-├── cli_file.c
-├── ser_arp.c
-├── received_ser_arp.c
-├── cli_arp.c
-├── ser_chat.c
-├── cli_chat.c
+EX7/
+├── ARP/
+│   ├── client.c
+│   └── server.c
+├── Chat/
+│   ├── client.c
+│   └── server.c
+├── File/
+│   ├── client.c
+│   └── server.c
+├── Self-Questions/
+│   ├── Examination/server.c
+│   ├── Hotel/server.c
+│   ├── FileSharing/{server.c, client.c}
+│   ├── ChatNotification/server.c
+│   ├── common/{net.c, net.h, terminal.c}
+│   ├── tests/check_systems.py
+│   └── Makefile
 └── README.md
 ```
 
----
+## Prerequisites
 
-# Requirements
+- a POSIX environment such as macOS or Linux;
+- a C11 compiler (`cc`, Clang, or GCC);
+- POSIX sockets and pthreads;
+- `make` and Python 3 for the advanced-system test suite.
 
-* GCC compiler
-* Unix/Linux-like operating system
-* POSIX socket support
-* POSIX threads (`pthread`)
-* Terminal access
+## Quick start
 
-For the Linux ARP server variant, the system should provide:
-
-```bash
-ip neigh
-```
-
-For systems using the traditional ARP utility:
+Build the advanced systems from the repository root:
 
 ```bash
-arp -a
+make -C Self-Questions
 ```
 
+The default output directory is `/tmp/ex7-systems-bin`, keeping compiled executables out of the source tree:
+
+```text
+examination_server    examination_client
+hotel_server          hotel_client
+files_server          files_client
+chat_server           chat_client
+```
+
+Choose another external build directory when needed:
+
+```bash
+make -C Self-Questions BUILD_DIR=/tmp/my-ex7-build
+```
+
+Run the integration suite:
+
+```bash
+make -C Self-Questions check
+```
+
+Run the same suite with memory and undefined-behavior instrumentation:
+
+```bash
+SANITIZE=1 make -C Self-Questions check
+```
+
+For runtime files, use a directory outside the repository:
+
+```bash
+mkdir -p /tmp/ex7-runtime/shared
+cd /tmp/ex7-runtime
+```
+
+## 1. Online Examination Management System
+
+The examination service keeps each student's answers and final score inside that connection's session. A mutex protects the account registry, preventing the same username from being active twice. Question reads and evaluation use a separate lock; question data is copied before network output so a slow client never holds the database lock.
+
+Start the server and client in separate terminals:
+
+```bash
+# Terminal 1 — from /tmp/ex7-runtime
+/tmp/ex7-systems-bin/examination_server 9001
+
+# Terminal 2
+/tmp/ex7-systems-bin/examination_client 127.0.0.1 9001
+```
+
+Demo accounts:
+
+| Username | Password |
+| --- | --- |
+| `student1` | `exam1` |
+| `student2` | `exam2` |
+| `student3` | `exam3` |
+| `student4` | `exam4` |
+
+Example session:
+
+```text
+LOGIN student1 exam1
+QUESTIONS
+ANSWER 1 B
+ANSWER 2 C
+ANSWER 3 A
+FINISH
+SCORE
+QUIT
+```
+
+`FINISH` evaluates the answers exactly once. Repeated `FINISH` or `SCORE` requests return the stored result, and answers cannot change after submission. Credentials are redacted from `examination.log`.
+
+## 2. Hotel Reservation System
+
+The hotel has ten rooms. A single transaction lock covers the availability check, reservation mutation, and disk commit, making the check-and-book operation atomic. When 16 clients race for one room, exactly one receives the booking.
+
+```bash
+# Terminal 1
+/tmp/ex7-systems-bin/hotel_server 9002 reservations.journal
+
+# Terminal 2
+/tmp/ex7-systems-bin/hotel_client 127.0.0.1 9002
+```
+
+Example session:
+
+```text
+AVAILABLE
+BOOK 1 Alice
+DETAILS <token-returned-by-BOOK>
+CANCEL <token-returned-by-BOOK>
+QUIT
+```
+
+A successful booking returns a random 128-bit bearer token:
+
+```text
+OK BOOKED 1 TOKEN 8c3d...32-hex-characters
+```
+
+The append-only journal records `BOOK` and `CANCEL` events and is replayed on startup. Each mutation is fully written and synchronized to disk before memory changes or success is reported. The process holds an exclusive lock on the journal, so two server instances cannot accidentally manage the same data. Corrupt or incomplete records stop startup instead of silently discarding reservations.
+
+Guest names accept 1–31 ASCII letters, digits, underscores, or hyphens. The private `hotel.log` provides an audit trail of requests and results.
+
+## 3. Concurrent File Sharing Server
+
+The file-sharing protocol combines line-framed commands with length-framed binary data. Each transfer uses its own file descriptor and buffer, allowing large and empty files to move concurrently without mixing bytes between clients.
+
+```bash
+# Put files in the shared directory, then start the server
+/tmp/ex7-systems-bin/files_server 9003 shared
+
+# List available regular files
+/tmp/ex7-systems-bin/files_client 127.0.0.1 9003 LIST
+
+# Download without overwriting an existing destination
+/tmp/ex7-systems-bin/files_client 127.0.0.1 9003 GET report.pdf downloaded-report.pdf
+```
+
+Wire format for a download:
+
+```text
+C: GET report.pdf\n
+S: DATA 42817\n
+S: <exactly 42,817 raw bytes>
+```
+
+Only regular files directly inside the configured shared directory are exposed. The server rejects paths, `.`/`..`, symbolic links, directories, special files, and invalid names. The client removes a partial output file if a transfer is interrupted and refuses to overwrite an existing destination.
+
+## 4. Chat Notification System
+
+Clients join with a unique display name and receive messages and presence notifications asynchronously. The active-client registry is protected by a mutex, while each client has an output mutex that prevents simultaneous broadcasts from interleaving response bytes.
+
+```bash
+# Terminal 1
+/tmp/ex7-systems-bin/chat_server 9004
+
+# Terminals 2, 3, ...
+/tmp/ex7-systems-bin/chat_client 127.0.0.1 9004
+```
+
+Example session:
+
+```text
+JOIN Alice
+MSG Hello everyone
+WHO
+QUIT
+```
+
+Recipients see `MESSAGE Alice Hello everyone`; all joined clients receive `NOTICE Alice joined` and `NOTICE Alice left` presence events. Broadcasts snapshot referenced client entries and release the registry mutex before network I/O. A slot is not reused until outstanding send references are released, avoiding descriptor-reuse races during disconnects.
+
+Concurrent senders may produce different valid message orders for different recipients; the service guarantees complete, non-interleaved messages rather than a global total order.
+
+## Foundational exercises
+
+The smaller exercises can be compiled directly into `/tmp`:
+
+```bash
+cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic ARP/server.c -o /tmp/arp_server -pthread
+cc -std=c11 -Wall -Wextra -Wpedantic ARP/client.c -o /tmp/arp_client
+
+cc -std=c11 -Wall -Wextra -Wpedantic Chat/server.c -o /tmp/basic_chat_server
+cc -std=c11 -Wall -Wextra -Wpedantic Chat/client.c -o /tmp/basic_chat_client
+
+cc -std=c11 -Wall -Wextra -Wpedantic File/server.c -o /tmp/basic_file_server
+cc -std=c11 -Wall -Wextra -Wpedantic File/client.c -o /tmp/basic_file_client
+```
+
+Typical invocation patterns:
+
+```bash
+/tmp/arp_server 8001              # client: /tmp/arp_client 127.0.0.1 8001
+/tmp/basic_chat_server 8002       # client: /tmp/basic_chat_client 127.0.0.1 8002
+/tmp/basic_file_server 8003       # client: /tmp/basic_file_client 127.0.0.1 8003
+```
+
+The ARP service maintains a simulated hash table and consults the host ARP cache. The basic chat uses a process per client for interactive request/reply conversation. The file-transfer pair sends a filename header followed by the original file bytes.
+
+## Protocol contract and operational limits
+
+Advanced-system commands are case-sensitive printable ASCII lines terminated by LF or CRLF. A line may contain at most 1,023 characters excluding its terminator. The servers reject oversized lines, embedded NUL bytes, malformed CRLF, invalid numbers, extra arguments, and truncated requests.
+
+Responses begin with `OK`, `ERR`, or a documented data/event keyword. Multi-line responses terminate with `END`. Raw binary appears only after a file server `DATA <byte-count>` header.
+
+| Limit | Value |
+| --- | ---: |
+| Simultaneous connected clients per server | 64 |
+| Request-line buffer | 1,024 bytes |
+| Receive inactivity timeout | 300 seconds |
+| Send timeout | 5 seconds |
+| Hotel rooms | 10 |
+| Examination questions | 3 |
+
+The servers bind to all IPv4 interfaces. Local clients use `127.0.0.1`; remote clients use the server's reachable IPv4 address. `QUIT` closes a session normally, while abrupt disconnects still release sockets, connection counts, login state, and chat membership.
+
+## Verification
+
+The Python suite launches actual server processes on ephemeral ports and drives real TCP clients. It currently contains nine integration scenarios covering:
+
+- four simultaneous examination sessions, duplicate-login rejection, scoring, and disconnect cleanup;
+- sixteen clients racing to reserve the same room, followed by restart, replay, lookup, and cancellation;
+- exclusive journal ownership and corrupt-journal refusal;
+- twelve parallel binary and empty-file downloads;
+- path traversal, absolute path, symlink, FIFO, and missing-file rejection;
+- interrupted-transfer cleanup and continued service after an aborted download;
+- eight simultaneous chat participants broadcasting and disconnecting;
+- oversized, non-ASCII, embedded-NUL, malformed-CRLF, truncated, and byte-fragmented requests;
+- end-to-end behavior of all four client executables.
+
+Test builds add `-Werror`, so warnings fail the suite. Setting `SANITIZE=1` adds AddressSanitizer and UndefinedBehaviorSanitizer instrumentation.
+
+## Design decisions and tradeoffs
+
+- **Thread per connection:** simple session ownership and readable control flow, bounded at 64 clients. An event-driven design would scale further but add complexity that is unnecessary for this laboratory scope.
+- **Text commands plus explicit binary lengths:** easy to inspect with a terminal while still supporting arbitrary file contents without delimiter ambiguity.
+- **No network I/O under core data locks:** question data is copied first, hotel responses are sent after committing and unlocking, and chat broadcasts use referenced snapshots.
+- **Append-only reservation journal:** easy to audit and recover. Long-running deployments would add compaction or move to a transactional database.
+- **Bearer booking tokens:** prevent room-number-only cancellation. Production deployment would add authenticated users, authorization policy, TLS, and protected secret storage.
+- **Immutable shared files during transfer:** the implementation opens and validates the selected file safely, but does not snapshot files modified externally during a download.
+- **Laboratory authentication:** examination accounts are intentionally fixed in source. A deployed system would use a database, salted password hashes, TLS, rate limiting, and persistent attempt records.
+
+## Logs and generated data
+
+The advanced servers create these files in their working directory:
+
+| File | Purpose |
+| --- | --- |
+| `examination.log` | Connections, redacted login attempts, requests, and scores |
+| `hotel.log` | Booking request/result audit trail |
+| `files.log` | File requests and transfer completion/interruption |
+| `chat.log` | Connections, chat commands, and disconnects |
+| chosen journal path | Durable hotel booking and cancellation events |
+
+Log records use local ISO-style timestamps and are flushed after each event. New log and journal files are created with owner-only permissions.
+
+## What this exercise demonstrates
+
+This project is intentionally small enough to audit, but it tackles the failure modes that separate a classroom socket example from a dependable network service: TCP has no message boundaries, writes may be partial, clients disappear, shared state races, storage fails, identifiers are reused, and untrusted input crosses every connection. The code makes those constraints visible and testable instead of hiding them behind a framework.
+
 ---
 
-# Summary
-
-| Application   | Protocol | Server Concurrency | Purpose                                         |
-| ------------- | -------- | ------------------ | ----------------------------------------------- |
-| File Transfer | TCP      | Multi-Process      | Transfer binary files between client and server |
-| ARP Lookup    | TCP      | Multi-Threaded     | Simulate IP-to-MAC address resolution           |
-| TCP Chat      | TCP      | Multi-Process      | Interactive client-server messaging             |
-
----
-
-## Key Learning Outcomes
-
-By working with these programs, you can understand:
-
-* TCP client-server architecture
-* Socket creation and connection establishment
-* File transfer through sockets
-* Multi-process servers using `fork()`
-* Multi-threaded servers using `pthread`
-* Mutex-based synchronization
-* Shared data protection
-* Hash-table implementation
-* IP address validation
-* Request-response communication
-* Interactive network messaging
-* Process and thread concurrency in Unix systems
+Built as Computer Networks Laboratory Exercise 7 using C11, POSIX sockets, pthreads, processes, file descriptors, and explicit application-layer protocols.
